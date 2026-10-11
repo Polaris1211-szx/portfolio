@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      // Apply appearance before styles load, including on the login page.
+      (() => {
+        let theme = 'evergreen'
+        let mode = 'auto'
+        try {
+          theme = localStorage.getItem('ledgerflow-theme') || theme
+          mode = localStorage.getItem('ledgerflow-color-mode') || mode
+        } catch { /* Appearance also works when storage is disabled. */ }
+        const dark = mode === 'dark' || (mode !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+        document.documentElement.dataset.theme = ['evergreen', 'slate', 'blue'].includes(theme) ? theme : 'evergreen'
+        document.documentElement.classList.toggle('dark', dark)
+        document.documentElement.style.colorScheme = dark ? 'dark' : 'light'
+      })()
+    </script>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Folio</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

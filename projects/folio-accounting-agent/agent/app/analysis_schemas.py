@@ -1,0 +1,265 @@
+"""Backend–Agent REVIEW contract. Keep identical in both repositories."""
+from datetime import date
+from decimal import Decimal
+from typing import Annotated, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+Money = Annotated[str, Field(pattern=r"^-?(?:0|[1-9][0-9]{0,17})(?:\.[0-9]{1,8})?$")]
+Currency = Annotated[str, Field(pattern=r"^[A-Z]{3}$")]
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ReviewFile(StrictModel):
+    document_id: UUID
+    storage_key: str = Field(min_length=1, max_length=200)
+    content_type: Literal["application/pdf", "image/png", "image/jpeg"]
+    document_type: str | None = Field(default=None, max_length=64)
+    submission_round: int | None = Field(default=None, ge=1)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    original_name: str = Field(max_length=255)
+    requirement_ids: list[UUID] = Field(default_factory=list, max_length=100)
+    scope: Literal["CURRENT", "HISTORY"] = "CURRENT"
+
+
+class ReviewTarget(StrictModel):
+    id: UUID
+    document_type: str = Field(min_length=1, max_length=64)
+    title: str = Field(min_length=1, max_length=200)
+    analysis_type: Literal["DOCUMENT_REQUIREMENT_VALIDATION", "BANK_TRANSACTION_RECONCILIATION"]
+    required: bool
+    instructions: str = Field(default="", max_length=4000)
+
+
+class ReviewClientFeatures(StrictModel):
+    uses_payment_platform: bool = False
+    has_employee_reimbursement: bool = False
+    has_loan: bool = False
+    multi_currency: bool = False
+    project_based: bool = False
+    has_retention: bool = False
+
+
+class ReviewBankAccount(StrictModel):
+    bank: str = Field(min_length=1, max_length=100)
+    account_last4: str = Field(pattern=r"^[0-9]{4}$")
+    currency: Currency
+
+
+class ReviewContext(StrictModel):
+    entity_name: str = Field(min_length=1, max_length=200)
+    period: date
+    submission_id: UUID
+    industry: str | None = Field(default=None, max_length=40)
+    base_currency: Currency | None = None
+    features: ReviewClientFeatures | None = None
+    bank_accounts: list[ReviewBankAccount] = Field(default_factory=list)
+
+
+class Search(StrictModel):
+    action: Literal["SEARCH_CURRENT", "SEARCH_HISTORY"]
+    requirement_id: UUID
+    document_type: str | None = Field(default=None, max_length=64)
+    period: date | None = None
+    query: str = Field(default="", max_length=200)
+    amount: Money | None = None
+    currency: Currency | None = None
+
+
+class ReviewRequest(StrictModel):
+    schema_version: Literal["1"] = "1"
+    run_id: UUID
+    purpose: Literal["REVIEW"]
+    review_preference: Literal["CAUTIOUS", "STANDARD", "EFFICIENT"] = "STANDARD"
+    turn: int = Field(default=0, ge=0, le=3)
+    context: ReviewContext
+    documents: list[ReviewFile] = Field(max_length=100)
+    requirements: list[ReviewTarget] = Field(max_length=100)
+    search_history: list[Search] = Field(default_factory=list, max_length=3)
+
+    @model_validator(mode="after")
+    def valid_ids(self):
+        ids = {r.id for r in self.requirements}
+        if len(ids) != len(self.requirements) or len({d.document_id for d in self.documents}) != len(self.documents):
+            raise ValueError("Duplicate IDs")
+        if any(not set(d.requirement_ids) <= ids for d in self.documents):
+            raise ValueError("Unknown requirement")
+        if len(self.search_history) != self.turn:
+            raise ValueError("Invalid search turn")
+        return self
+
+
+class Transaction(StrictModel):
+    date: date
+    description: str = Field(max_length=500)
+    amount: Money
+    currency: Currency
+
+
+class Extraction(StrictModel):
+    document_id: UUID
+    document_type: str | None = Field(default=None, max_length=64)
+    entity_name: str | None = Field(default=None, max_length=200)
+    period: date | None = None
+    invoice_number: str | None = Field(default=None, max_length=100)
+    counterparty: str | None = Field(default=None, max_length=200)
+    amount: Money | None = None
+    currency: Currency | None = None
+    transactions: list[Transaction] = Field(default_factory=list, max_length=500)
+
+
+class Evidence(StrictModel):
+    document_id: UUID
+    relation: Literal["SUPPORTS", "CONTRADICTS", "REFERENCE"]
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class AmountOperand(StrictModel):
+    document_id: UUID
+    amount: Money
+    label: str = Field(min_length=1, max_length=200)
+
+
+class AmountRelation(StrictModel):
+    currency: Currency
+    operation: Literal["SUM", "SUBTRACT", "MULTIPLY"]
+    operands: list[AmountOperand] = Field(min_length=1, max_length=30)
+    expected_amount: Money
+    actual_amount: Money
+    difference: Money
+
+
+class Finding(StrictModel):
+    requirement_id: UUID
+    action: Literal["ASK_CLIENT", "RESOLVE", "ESCALATE"]
+    suggested_decision: Literal["SATISFY", "REQUEST_ACTION"] | None
+    issue_code: Literal["MISSING", "WRONG_PERIOD", "ENTITY_MISMATCH", "UNREADABLE", "INCOMPLETE", "OTHER"] | None
+    entity_check: Literal["MATCH", "MISMATCH", "UNKNOWN"]
+    period_check: Literal["MATCH", "MISMATCH", "UNKNOWN"]
+    explanation: str = Field(min_length=1, max_length=2000)
+    client_message: str | None = Field(default=None, max_length=2000)
+    requested_document_type: str | None = Field(default=None, max_length=64)
+    evidence: list[Evidence] = Field(max_length=100)
+    amounts: list[AmountRelation] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def valid_action(self):
+        if self.action == "ASK_CLIENT" and (self.suggested_decision != "REQUEST_ACTION" or not self.issue_code or not self.client_message):
+            raise ValueError("Client action requires a reason and message")
+        if self.action == "RESOLVE" and (self.suggested_decision != "SATISFY" or not self.evidence or self.issue_code):
+            raise ValueError("Resolution requires supporting evidence")
+        if self.action == "ESCALATE" and self.suggested_decision is not None:
+            raise ValueError("Escalation is not a decision")
+        if self.action == "ASK_CLIENT" and self.issue_code in ("MISSING", "INCOMPLETE") \
+                and not self.requested_document_type:
+            raise ValueError("Missing support must name the requested document type")
+        ids = [e.document_id for e in self.evidence]
+        if len(ids) != len(set(ids)) or any(o.document_id not in ids for a in self.amounts for o in a.operands):
+            raise ValueError("Invalid amount evidence")
+        return self
+
+
+class ReviewResponse(StrictModel):
+    schema_version: Literal["1"]
+    run_id: UUID
+    model_version: str = Field(min_length=1, max_length=200)
+    extractions: list[Extraction] = Field(max_length=100)
+    findings: list[Finding] = Field(max_length=100)
+    search: Search | None = None
+
+
+def _validate_expense_receipts(body: ReviewRequest, output: ReviewResponse) -> None:
+    if output.search:
+        return
+    receipt_requirements = {r.id for r in body.requirements if r.document_type == "RECEIPT"}
+    extractions = {row.document_id: row for row in output.extractions}
+    document_types = {doc.document_id: doc.document_type or (extractions[doc.document_id].document_type
+                      if doc.document_id in extractions else None) for doc in body.documents}
+    claim_documents = [doc for doc in body.documents if document_types[doc.document_id] == "EXPENSE_CLAIM"]
+    claims = [doc.document_id for doc in claim_documents if not any(
+        set(doc.requirement_ids) & set(newer.requirement_ids)
+        and (newer.submission_round or 0) > (doc.submission_round or 0)
+        for newer in claim_documents
+    )]
+    if not claims:
+        return
+    claim_requirements = {r.id for r in body.requirements if r.document_type == "EXPENSE_CLAIM"}
+    relevant = [finding for finding in output.findings if finding.suggested_decision == "SATISFY" and (
+        finding.requirement_id in receipt_requirements | claim_requirements
+        or any(e.document_id in claims for e in finding.evidence))]
+    if not relevant:
+        return
+    superseded = {doc.document_id for doc in claim_documents} - set(claims)
+    if any(e.document_id in superseded and e.relation == "SUPPORTS" for f in relevant for e in f.evidence):
+        raise ValueError("Expense claim resolution cannot rely on a superseded submission")
+    receipts = [doc.document_id for doc in body.documents if document_types[doc.document_id] == "RECEIPT"]
+    used = set()
+    matched_by_claim = {}
+    for claim_id in claims:
+        claim = extractions.get(claim_id)
+        if not claim or not claim.amount or not claim.currency or not claim.transactions:
+            raise ValueError(f"Expense claim needs amount, currency and itemized transactions before automatic satisfaction: document_id={claim_id}")
+        if any(row.currency != claim.currency or Decimal(row.amount) <= 0 for row in claim.transactions) \
+                or sum(Decimal(row.amount) for row in claim.transactions) != Decimal(claim.amount):
+            raise ValueError("Expense claim lines do not reconcile to its total")
+        matched = set()
+        for line in claim.transactions:
+            receipt_id = next((doc_id for doc_id in receipts if doc_id not in used
+                               and (receipt := extractions.get(doc_id)) and receipt.currency == line.currency
+                               and receipt.amount and Decimal(receipt.amount) == Decimal(line.amount)), None)
+            if receipt_id is None:
+                raise ValueError("Every expense claim line needs a distinct matching receipt")
+            used.add(receipt_id)
+            matched.add(receipt_id)
+        matched_by_claim[claim_id] = matched
+    required_evidence = set(claims) | used
+    if any(not required_evidence <= {e.document_id for e in finding.evidence} for finding in relevant):
+        raise ValueError("Expense claim resolution must cite the claim and every matching receipt")
+    for finding in relevant:
+        if finding.requirement_id not in claim_requirements:
+            continue
+        for claim_id, receipt_ids in matched_by_claim.items():
+            if not any(relation.operation == "SUM" and relation.currency == extractions[claim_id].currency
+                       and len(relation.operands) == len(receipt_ids)
+                       and {operand.document_id for operand in relation.operands} == receipt_ids
+                       and all(Decimal(operand.amount) == Decimal(extractions[operand.document_id].amount)
+                               for operand in relation.operands if operand.document_id in receipt_ids)
+                       and Decimal(relation.expected_amount) == Decimal(extractions[claim_id].amount)
+                       for relation in finding.amounts):
+                raise ValueError("Expense claim total must be reconciled from original receipt amounts")
+
+
+def validate_review(body: ReviewRequest, result: object) -> ReviewResponse:
+    output = ReviewResponse.model_validate(result)
+    req_ids = {r.id for r in body.requirements}
+    doc_ids = {d.document_id for d in body.documents}
+    finding_ids = [f.requirement_id for f in output.findings]
+    extracted_ids = [e.document_id for e in output.extractions]
+    if output.run_id != body.run_id or len(set(finding_ids)) != len(finding_ids) or not set(finding_ids) <= req_ids:
+        raise ValueError("Unknown or duplicate finding")
+    if len(set(extracted_ids)) != len(extracted_ids) or not set(extracted_ids) <= doc_ids:
+        raise ValueError("Unknown or duplicate extraction")
+    if any(e.document_id not in doc_ids for f in output.findings for e in f.evidence):
+        raise ValueError("Unknown evidence")
+    requirements_by_type = {}
+    for requirement in body.requirements:
+        requirements_by_type.setdefault(requirement.document_type, set()).add(requirement.id)
+    for finding in output.findings:
+        if finding.action != "ASK_CLIENT" or finding.issue_code not in ("MISSING", "INCOMPLETE"):
+            continue
+        target_requirements = requirements_by_type.get(finding.requested_document_type)
+        if not target_requirements:
+            raise ValueError("Requested document type must exist in the collection requirements")
+        if finding.requirement_id not in target_requirements:
+            raise ValueError("Client action must target the requested document requirement")
+    if output.search:
+        if output.search.requirement_id not in req_ids or output.findings or body.turn >= 3 or output.search in body.search_history:
+            raise ValueError("Search response must not contain final findings")
+    elif set(finding_ids) != req_ids or set(extracted_ids) != doc_ids:
+        raise ValueError("Final review must cover every input requirement and document")
+    _validate_expense_receipts(body, output)
+    return output

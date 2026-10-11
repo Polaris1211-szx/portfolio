@@ -1,0 +1,559 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from evaluator.local_evaluator import catalog_index, evaluate
+from shopping_copilot.core.config import load_config
+from shopping_copilot.core.contracts import (
+    Candidate,
+    PolicyDecision,
+    RankedCandidate,
+    RetrievalDiagnostics,
+    RetrievalResult,
+    SessionState,
+)
+from shopping_copilot.core.factory import build_components
+from shopping_copilot.policy.heuristic import HeuristicPolicy
+from shopping_copilot.policy.information_gain import InformationGainQuestionScorer
+from shopping_copilot.state.rule_state import RuleStateTracker
+from starter.agent import Agent
+
+
+PROFILE = {
+    "purchase_frequency": "1-2 prior purchases",
+    "average_prior_rating": 4.5,
+    "rating_style": "usually positive",
+    "preference_tags": ["comfort"],
+    "summary": "Prior purchases emphasize comfort.",
+}
+
+
+class TeamPipelineTest(unittest.TestCase):
+    def test_full_rank_config_preserves_anchor_pool_for_global_ranking(self) -> None:
+        config = load_config("configs/final.json")
+
+        self.assertTrue(config.search.category_anchor_full_pool)
+        self.assertTrue(config.policy.global_response_ranking)
+
+    def _catalog(self, root: Path) -> Path:
+        products = [
+            {
+                "parent_asin": "A",
+                "title": "Waterproof hiking shoes",
+                "features": ["waterproof", "comfortable"],
+                "details": {"material": "synthetic"},
+                "description": ["winter outdoor hiking shoe"],
+                "categories": ["Clothing", "Shoes"],
+                "store": "Example",
+                "price": 79.0,
+                "average_rating": 4.5,
+                "rating_number": 50,
+            },
+            {
+                "parent_asin": "B",
+                "title": "Cotton casual shirt",
+                "features": ["cotton"],
+                "details": {"department": "mens"},
+                "description": ["casual summer shirt"],
+                "categories": ["Clothing", "Shirts"],
+                "store": "Example",
+                "price": 29.0,
+                "average_rating": 4.0,
+                "rating_number": 20,
+            },
+        ]
+        path = root / "catalog.jsonl"
+        path.write_text("".join(json.dumps(item) + "\n" for item in products), encoding="utf-8")
+        return path
+
+    def _cotton_shoe_catalog(self, root: Path, count: int = 12) -> Path:
+        products = [
+            {
+                "parent_asin": f"P{index:02d}",
+                "title": f"Cotton casual shoe model {index:02d}",
+                "features": ["cotton"],
+                "details": {"material": "cotton"},
+                "description": ["casual cotton shoe"],
+                "categories": ["Clothing", "Shoes"],
+                "store": "Example",
+                "price": 29.0,
+            }
+            for index in range(count)
+        ]
+        path = root / "cotton_shoes.jsonl"
+        path.write_text("".join(json.dumps(item) + "\n" for item in products), encoding="utf-8")
+        return path
+
+    def test_fixed_questioning_uses_broad_fallback_after_two_no_preference_answers(self) -> None:
+        state = SessionState(session_id="fallback")
+        state.asked_attributes.extend(["feature", "budget", "size"])
+        state.no_preference_attributes.update({"budget", "size"})
+
+        self.assertEqual(HeuristicPolicy._select_fixed_attribute(state, "buying"), "other")
+
+    def test_fixed_questioning_does_not_fallback_after_one_no_preference_answer(self) -> None:
+        state = SessionState(session_id="fallback")
+        state.asked_attributes.extend(["feature", "budget"])
+        state.no_preference_attributes.add("budget")
+
+        self.assertEqual(HeuristicPolicy._select_fixed_attribute(state, "buying"), "material")
+
+    def test_fixed_buying_questions_prioritize_color_before_budget(self) -> None:
+        state = SessionState(session_id="color-priority")
+        state.active_slots.update({"category": ["shoes"], "material": ["leather"]})
+        state.asked_attributes.extend(["feature", "material"])
+
+        self.assertEqual(HeuristicPolicy._select_fixed_attribute(state, "buying"), "color")
+
+    def test_official_entry_returns_contract_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._catalog(Path(directory))
+            agent = Agent(catalog, config_path="configs/baseline.json")
+            agent.reset("s1", PROFILE)
+            response = agent.respond(
+                "s1",
+                "I'm looking for shoes. A key requirement is waterproof.",
+                1,
+                10,
+            )
+            self.assertEqual(response["recommendations"][0]["parent_asin"], "A")
+            self.assertIsInstance(response["message"], str)
+            self.assertIn(response["ask_attribute"], {None, "material", "budget", "size", "color", "style", "use_case", "feature", "other"})
+            self.assertEqual(response["usage"], {"prompt_tokens": 0, "completion_tokens": 0})
+
+    def test_state_accumulates_and_override_erases_old_preference(self) -> None:
+        tracker = RuleStateTracker()
+        tracker.reset("s2", PROFILE)
+        tracker.update("s2", "I'm looking for shoes with leather material.", 1)
+        state = tracker.update(
+            "s2",
+            "Actually, ignore my earlier preference. What I need is cotton.",
+            3,
+        )
+        self.assertEqual(state.active_slots["material"], ["cotton"])
+        self.assertNotIn("leather", state.excluded_terms)
+        self.assertNotIn("leather", state.active_context[-1].lower())
+
+    def test_pending_attribute_classifies_short_clarification_answer(self) -> None:
+        tracker = RuleStateTracker()
+        tracker.reset("s", {})
+        tracker.mark_asked("s", "material")
+
+        state = tracker.update("s", "For that, what matters is: merino wool.", 2)
+
+        self.assertEqual(state.active_slots["material"], ["merino wool"])
+        self.assertIsNone(state.pending_attribute)
+
+    def test_boundary_answer_uses_pending_attribute_without_query_pollution(self) -> None:
+        tracker = RuleStateTracker()
+        tracker.reset("s", {})
+        tracker.mark_asked("s", "color")
+
+        state = tracker.update("s", "Either is fine; please use your judgment.", 2)
+
+        self.assertIn("color", state.no_preference_attributes)
+        self.assertNotIn("color", state.active_slots)
+        self.assertEqual(state.active_context, [])
+
+    def test_key_requirement_marker_creates_feature_slot(self) -> None:
+        tracker = RuleStateTracker()
+        tracker.reset("s", {})
+
+        state = tracker.update(
+            "s",
+            "I'm looking for shirts. A key requirement is: machine washable.",
+            1,
+        )
+
+        self.assertEqual(state.active_slots["feature"], ["machine washable"])
+        self.assertEqual(state.intent_mode, "buying")
+
+    def test_structured_route_contributes_candidates_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._catalog(Path(directory))
+            config = load_config("configs/experiments/structured_hybrid.json")
+            components = build_components(catalog, config)
+            state = components.state_tracker.reset("structured", PROFILE)
+            state = components.state_tracker.update(
+                "structured",
+                "I'm looking for shoes. A key requirement is: waterproof.",
+                1,
+            )
+            plan = components.planner.build(state)
+
+            result = components.retriever.retrieve(plan)
+            by_id = {candidate.parent_asin: candidate for candidate in result.candidates}
+
+            self.assertTrue(plan.use_structured)
+            self.assertIn("A", by_id)
+            self.assertIn("structured", by_id["A"].source_routes)
+
+    def test_category_anchor_route_contributes_exact_category_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._catalog(Path(directory))
+            config = load_config("configs/final.json")
+            components = build_components(catalog, config)
+            state = components.state_tracker.reset("anchor", PROFILE)
+            state = components.state_tracker.update(
+                "anchor",
+                "I'm looking for Shoes. A key requirement is: waterproof.",
+                1,
+            )
+            plan = components.planner.build(state)
+
+            result = components.retriever.retrieve(plan)
+            by_id = {candidate.parent_asin: candidate for candidate in result.candidates}
+
+            self.assertTrue(config.search.category_anchor_enabled)
+            self.assertIn("A", by_id)
+            self.assertIn("category_anchor", by_id["A"].source_routes)
+
+    def test_browsing_turn_asks_a_structured_question(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._catalog(Path(directory))
+            agent = Agent(catalog, config_path="configs/baseline.json")
+            agent.reset("s3", PROFILE)
+            response = agent.respond("s3", "I'm looking for shoes, but I'm still exploring.", 1, 10)
+            self.assertEqual(response["ask_attribute"], "use_case")
+
+    def test_other_first_policy_can_repeat_until_requirements_are_drained(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._catalog(Path(directory))
+            agent = Agent(catalog, config_path="configs/final.json")
+            agent.reset("other-first", PROFILE)
+
+            first = agent.respond(
+                "other-first",
+                "I'm looking for Shoes, but I'm still exploring.",
+                1,
+                10,
+            )
+            second = agent.respond(
+                "other-first",
+                "For that, what matters is: waterproof; synthetic.",
+                2,
+                10,
+            )
+            third = agent.respond(
+                "other-first",
+                "I don't have an additional preference for other.",
+                3,
+                10,
+            )
+
+            self.assertEqual(first["ask_attribute"], "other")
+            self.assertEqual(second["ask_attribute"], "other")
+            self.assertNotEqual(third["ask_attribute"], "other")
+
+    def test_boundary_no_preference_does_not_end_open_requirement_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._catalog(Path(directory))
+            agent = Agent(catalog, config_path="configs/final.json")
+            agent.reset("boundary-other", PROFILE)
+            first = agent.respond(
+                "boundary-other",
+                "I'm looking for Shoes, but I'm still exploring.",
+                1,
+                10,
+            )
+            second = agent.respond(
+                "boundary-other",
+                "I don't have a preference for other; please use your judgment.",
+                2,
+                10,
+            )
+
+            self.assertEqual(first["ask_attribute"], "other")
+            self.assertEqual(second["ask_attribute"], "other")
+
+    def test_slate_gate_starts_compact_and_expands_after_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._catalog(Path(directory))
+            components = build_components(
+                catalog,
+                load_config("configs/final.json"),
+            )
+            decision = PolicyDecision(True, "other", "question", 10)
+            state = SessionState("slate", turn=1)
+            uncertain = [RankedCandidate("A", 1.0, {"matched_product_constraint_count": 0.0})]
+
+            compact = components.policy._apply_slate_gate(state, uncertain, decision)
+            state.turn = 3
+            supported = [RankedCandidate("A", 1.0, {"matched_product_constraint_count": 2.0})]
+            expanded = components.policy._apply_slate_gate(state, supported, decision)
+
+            self.assertEqual(compact.recommendation_count, 1)
+            self.assertEqual(expanded.recommendation_count, 10)
+
+    def test_override_bypasses_presearch_question_but_keeps_slate_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._cotton_shoe_catalog(Path(directory))
+            agent = Agent(catalog, config_path="configs/final.json")
+            agent.reset("slate-override", PROFILE)
+
+            ordinary = agent.respond(
+                "slate-override",
+                "I'm looking for shoes. Easy to use without wiggling.",
+                1,
+                10,
+            )
+            override = agent.respond(
+                "slate-override",
+                "Actually, ignore my earlier preference. What I need is: cotton.",
+                3,
+                10,
+            )
+
+            self.assertIsNotNone(ordinary["ask_attribute"])
+            self.assertEqual(len(ordinary["recommendations"]), 1)
+            self.assertEqual(override["ask_attribute"], "other")
+            self.assertEqual(len(override["recommendations"]), 1)
+
+            components = agent._impl.components
+            state = components.state_tracker.get("slate-override")
+            plan = components.planner.build(state)
+            forced_overload = RetrievalDiagnostics(5000, 5000, 0.0, plan.route)
+            self.assertIsNone(components.policy.before_search(state, plan, forced_overload))
+            self.assertEqual(state.pending_attribute, "other")
+
+    def test_information_gain_prefers_attribute_that_splits_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            products = [
+                {
+                    "parent_asin": "A",
+                    "title": "Black cotton walking shoe",
+                    "features": ["comfortable"],
+                    "details": {"material": "cotton"},
+                    "description": ["walking shoe"],
+                    "categories": ["Clothing", "Shoes"],
+                    "store": "Example",
+                    "price": 50,
+                },
+                {
+                    "parent_asin": "B",
+                    "title": "Black leather walking shoe",
+                    "features": ["comfortable"],
+                    "details": {"material": "leather"},
+                    "description": ["walking shoe"],
+                    "categories": ["Clothing", "Shoes"],
+                    "store": "Example",
+                    "price": 50,
+                },
+                {
+                    "parent_asin": "C",
+                    "title": "Black wool walking shoe",
+                    "features": ["comfortable"],
+                    "details": {"material": "wool"},
+                    "description": ["walking shoe"],
+                    "categories": ["Clothing", "Shoes"],
+                    "store": "Example",
+                    "price": 50,
+                },
+            ]
+            catalog = root / "catalog.jsonl"
+            catalog.write_text("".join(json.dumps(item) + "\n" for item in products), encoding="utf-8")
+            config = load_config("configs/experiments/information_gain_policy.json")
+            components = build_components(catalog, config)
+            scorer = InformationGainQuestionScorer(
+                components.ranker.store,
+                candidate_limit=60,
+                minimum_coverage=0.12,
+                minimum_score=0.01,
+            )
+            ranked = [
+                RankedCandidate(item, 1.0, {})
+                for item in ("A", "B", "C")
+            ]
+
+            selected = scorer.choose(SessionState("information-gain"), ranked)
+
+            self.assertEqual(selected, "material")
+
+    def test_information_gain_policy_is_used_after_candidate_search(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = self._catalog(root)
+            agent = Agent(catalog, config_path="configs/experiments/information_gain_policy.json")
+            agent.reset("ig", PROFILE)
+
+            response = agent.respond("ig", "I'm looking for clothing, but I'm still exploring.", 1, 10)
+
+            self.assertIn(response["ask_attribute"], {
+                "material", "feature", "color", "size", "style", "use_case", "budget", "brand", "other"
+            })
+
+    def test_last_turn_does_not_ask(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._catalog(Path(directory))
+            agent = Agent(catalog, config_path="configs/baseline.json")
+            agent.reset("s4", PROFILE)
+            response = agent.respond("s4", "I'm looking for shoes, but I'm still exploring.", 10, 10)
+            self.assertIsNone(response["ask_attribute"])
+
+    def test_stagnant_candidate_pool_rotates_to_unseen_products(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            products = [
+                {
+                    "parent_asin": f"P{index:02d}",
+                    "title": f"Cotton casual shirt model {index:02d}",
+                    "features": ["cotton", "comfortable"],
+                    "details": {"department": "mens"},
+                    "description": ["casual summer shirt"],
+                    "categories": ["Clothing", "Shirts"],
+                    "store": "Example",
+                    "price": 29.0,
+                }
+                for index in range(25)
+            ]
+            catalog = root / "catalog.jsonl"
+            catalog.write_text(
+                "".join(json.dumps(item) + "\n" for item in products),
+                encoding="utf-8",
+            )
+            agent = Agent(catalog, config_path="configs/experiments/stagnation_coverage.json")
+            agent.reset("coverage", PROFILE)
+
+            first = agent.respond(
+                "coverage",
+                "I'm looking for shirts, but I'm still exploring.",
+                1,
+                10,
+            )
+            response = first
+            for turn in range(2, 5):
+                response = agent.respond(
+                    "coverage",
+                    f"I don't have an additional preference for {response['ask_attribute']}.",
+                    turn,
+                    10,
+                )
+
+            first_ids = {item["parent_asin"] for item in first["recommendations"]}
+            rotated_ids = {item["parent_asin"] for item in response["recommendations"]}
+            self.assertEqual(len(first_ids), 10)
+            self.assertEqual(len(rotated_ids), 10)
+            self.assertTrue(first_ids.isdisjoint(rotated_ids))
+
+    def test_override_clears_candidate_coverage_history(self) -> None:
+        tracker = RuleStateTracker()
+        state = tracker.reset("override-coverage", PROFILE)
+        state.active_slots["material"] = ["cotton"]
+        state.shown_asins.update({"A", "B"})
+        state.previous_candidate_ids = ("A", "B")
+        state.previous_slot_signature = (("category", ("shoes",)),)
+        state.stagnant_candidate_turns = 2
+        state.coverage_mode = True
+
+        state = tracker.update(
+            "override-coverage",
+            "Actually, ignore my earlier preference. What I need is cotton.",
+            3,
+        )
+
+        self.assertEqual(state.shown_asins, set())
+        self.assertEqual(state.previous_candidate_ids, ())
+        self.assertFalse(state.coverage_mode)
+
+    def test_dynamic_ranking_boosts_accumulated_constraints(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._catalog(Path(directory))
+            config = load_config("configs/experiments/stagnation_coverage.json")
+            components = build_components(catalog, config)
+            state = components.state_tracker.reset("dynamic-rank", PROFILE)
+            state = components.state_tracker.update(
+                "dynamic-rank",
+                "I'm looking for shoes. A key requirement is: waterproof.",
+                1,
+            )
+            plan = components.planner.build(state)
+            result = RetrievalResult(
+                candidates=(
+                    Candidate("A", lexical_score=1.0),
+                    Candidate("B", lexical_score=1.0),
+                ),
+                diagnostics=RetrievalDiagnostics(2, 2, 0.0, plan.route),
+            )
+
+            ranked = components.ranker.rank(state, plan, result)
+
+            self.assertEqual(ranked[0].parent_asin, "A")
+            self.assertGreater(
+                ranked[0].component_scores["constraint_weight"],
+                plan.constraint_weight,
+            )
+
+    def test_specific_complete_match_receives_ranking_bonus(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            products = [
+                {
+                    "parent_asin": "A",
+                    "title": "Blue easy-care shirt",
+                    "features": ["machine washable"],
+                    "details": {"color": "blue"},
+                    "categories": ["Clothing", "Shirts"],
+                    "store": "Example",
+                },
+                {
+                    "parent_asin": "B",
+                    "title": "Blue shirt",
+                    "features": ["hand wash only"],
+                    "details": {"color": "blue"},
+                    "categories": ["Clothing", "Shirts"],
+                    "store": "Example",
+                },
+            ]
+            catalog = root / "catalog.jsonl"
+            catalog.write_text(
+                "".join(json.dumps(item) + "\n" for item in products),
+                encoding="utf-8",
+            )
+            components = build_components(
+                catalog,
+                load_config("configs/final.json"),
+            )
+            state = components.state_tracker.reset("specific", PROFILE)
+            state.active_slots = {
+                "category": ["shirts"],
+                "color": ["blue"],
+                "feature": ["machine washable"],
+            }
+            plan = components.planner.build(state)
+            result = RetrievalResult(
+                candidates=(Candidate("A", lexical_score=1.0), Candidate("B", lexical_score=1.0)),
+                diagnostics=RetrievalDiagnostics(2, 1, 0.0, plan.route),
+            )
+
+            ranked = components.ranker.rank(state, plan, result)
+
+            self.assertEqual(ranked[0].parent_asin, "A")
+            self.assertEqual(ranked[0].component_scores["all_constraints_match"], 1.0)
+            self.assertEqual(ranked[1].component_scores["all_constraints_match"], 0.0)
+
+    def test_pipeline_runs_inside_official_evaluator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = self._catalog(Path(directory))
+            catalog_ids, categories, products = catalog_index(catalog)
+            samples = [{
+                "sample_id": "team_smoke_0001",
+                "scenario_type": "buying",
+                "user_profile": PROFILE,
+                "ground_truth": {"parent_asin": "A"},
+            }]
+            result = evaluate(
+                Agent(catalog, config_path="configs/baseline.json"),
+                samples,
+                catalog_ids,
+                categories,
+                products,
+            )
+            self.assertEqual(result["hit_rate_at_10"], 1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

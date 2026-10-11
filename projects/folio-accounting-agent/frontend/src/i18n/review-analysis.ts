@@ -1,0 +1,28 @@
+export const reviewAnalysisMessages = {
+  en: {
+    title: 'AI analysis',
+    states: { QUEUED: 'Waiting to analyze', PROCESSING: 'Analyzing submitted documents…', SUCCEEDED: 'Analysis ready', FAILED: 'Analysis unavailable · continue manually', CANCELLED: 'Superseded analysis' },
+    actions: { ASK_CLIENT: 'Suggested correction', RESOLVE: 'Supporting evidence found', ESCALATE: 'Accountant review needed' },
+    checks: { MATCH: 'Matches', MISMATCH: 'Does not match', UNKNOWN: 'Not verified' },
+    entity: 'Entity', period: 'Period', evidence: 'Evidence', suggestedMessage: 'Suggested client message',
+    autoApplied: { SATISFY: 'Marked satisfied automatically', REQUEST_ACTION: 'Returned automatically' }, manualReasons: { ESCALATED: 'Escalated to manual review', LOW_CONFIDENCE: 'Previously sent to manual review by a legacy threshold', INSUFFICIENT_EVIDENCE: 'Not enough verifiable evidence for automatic return', AMOUNT_MISMATCH: 'Amount calculation did not match' },
+    scopes: { CURRENT: 'Current request', HISTORY: 'Historical document' }, relations: { SUPPORTS: 'Supports', CONTRADICTS: 'Contradicts', REFERENCE: 'Reference' },
+    amounts: 'Amounts', expected: 'Expected', difference: 'Difference', recomputed: 'Arithmetic verified by the backend. Verify the source figures against the documents.', amountMismatch: 'Arithmetic mismatch. Manual verification required.',
+    extracted: 'Extracted fields', number: 'Document number', counterparty: 'Counterparty', date: 'Date', description: 'Description', unavailableFile: 'Document no longer available',
+    loadError: 'Could not load AI analysis. Manual review is still available.',
+    errors: { AGENT_UNAVAILABLE: 'The analysis service is unavailable. Retry or continue manually.', AGENT_INVALID_RESPONSE: 'The analysis response failed validation. Continue manually or retry.', INVALID_EVIDENCE: 'An evidence reference failed access validation. Continue manually.', SEARCH_LIMIT_REACHED: 'The search limit was reached. Please review the supporting documents manually.', REVIEW_SUPERSEDED: 'The request has moved on; this analysis was not applied.', REVIEW_TOO_LARGE: 'The submission exceeds the analysis limit. Review these documents manually.', UNKNOWN: 'Analysis could not complete. You can continue with manual review.' },
+  },
+  'zh-CN': {
+    title: 'AI 分析',
+    states: { QUEUED: '等待分析', PROCESSING: '正在分析已提交资料…', SUCCEEDED: '分析已完成', FAILED: '分析不可用，可继续人工审核', CANCELLED: '分析已失效' },
+    actions: { ASK_CLIENT: '建议补交或更正', RESOLVE: '已找到支持证据', ESCALATE: '需要会计复核' },
+    checks: { MATCH: '匹配', MISMATCH: '不匹配', UNKNOWN: '尚未验证' },
+    entity: '主体', period: '期间', evidence: '审核证据', suggestedMessage: '建议客户说明',
+    autoApplied: { SATISFY: '已自动标记通过', REQUEST_ACTION: '已自动退回' }, manualReasons: { ESCALATED: '模型已转人工复核', LOW_CONFIDENCE: '此前因旧版阈值转人工复核', INSUFFICIENT_EVIDENCE: '自动退回缺少可核对的证据', AMOUNT_MISMATCH: '金额重算不一致' },
+    scopes: { CURRENT: '当前请求', HISTORY: '历史资料' }, relations: { SUPPORTS: '支持', CONTRADICTS: '存在矛盾', REFERENCE: '参考' },
+    amounts: '金额', expected: '预期金额', difference: '差额', recomputed: '后端重算一致，请对照原文件核实金额来源。', amountMismatch: '金额重算不一致，需人工核实。',
+    extracted: '提取字段', number: '单据编号', counterparty: '交易对手方', date: '日期', description: '描述', unavailableFile: '文件已不可用',
+    loadError: '无法加载 AI 分析，仍可继续人工审核。',
+    errors: { AGENT_UNAVAILABLE: '分析服务暂不可用，可重试或继续人工审核。', AGENT_INVALID_RESPONSE: '分析结果未通过校验，可重试或继续人工审核。', INVALID_EVIDENCE: '证据未通过访问权限校验，请人工处理。', SEARCH_LIMIT_REACHED: '已达到搜索次数上限，请人工核对支持文件。', REVIEW_SUPERSEDED: '请求状态已变化，本次分析未应用。', REVIEW_TOO_LARGE: '提交资料超过分析容量限制，请人工审核。', UNKNOWN: '分析未能完成，可继续人工审核。' },
+  },
+}

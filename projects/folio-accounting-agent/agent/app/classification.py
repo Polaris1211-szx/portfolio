@@ -1,0 +1,128 @@
+import base64
+from collections import OrderedDict
+from hashlib import sha256
+from threading import Lock
+from time import perf_counter
+
+import httpx
+from pydantic import ValidationError
+
+from app.config import settings
+from app.errors import AgentError
+from app.model_client import require_model_config
+from app.deepseek import classify_with_deepseek
+from app.schemas import AnalyzeRequest, ClassificationResponse
+from app.storage import read_document
+from app.telemetry import elapsed_ms, event
+
+KEYWORDS = {
+    "BANK_STATEMENT": ("bank statement", "bank", "statement", "银行对账单", "对账单", "流水"),
+    "PURCHASE_INVOICE": ("purchase invoice", "supplier invoice", "purchase", "supplier", "vendor", "采购"),
+    "SALES_INVOICE": ("sales", "invoice", "销售", "发票"),
+    "RECEIPT": ("receipt", "收据", "小票"),
+    "PAYMENT_PLATFORM_REPORT": ("stripe", "paypal", "settlement", "结算"),
+    "LOAN_STATEMENT": ("loan statement", "loan", "贷款对账单", "贷款"),
+    "SUPPLIER_INVOICE": ("purchase", "supplier", "vendor", "采购"),
+    "CREDIT_NOTE": ("credit note", "贷项通知单", "贷项"),
+    "SALES_REPORT": ("sales report", "销售报表"),
+    "SETTLEMENT_REPORT": ("settlement report", "settlement", "结算报告", "结算"),
+    "PAYROLL_REPORT": ("payroll", "工资报表", "工资单"),
+    "EXPENSE_CLAIM": ("expense claim", "reimbursement", "报销"),
+    "FX_ADVICE": ("fx advice", "foreign exchange", "换汇", "汇兑"),
+    "PROGRESS_CLAIM": ("progress claim", "progress billing", "进度款申请", "进度款"),
+    "PAYMENT_CERTIFICATE": ("payment certificate", "付款证书", "付款证明"),
+    "OPEN_ITEMS_REGISTER": ("open items", "未结项", "未结清"),
+}
+cache = OrderedDict()
+lock = Lock()
+
+
+def classify(body: AnalyzeRequest, key: str, supplied_files: list[bytes] | None = None):
+    fingerprint = sha256(body.model_dump_json().encode()).hexdigest()
+    # ponytail: serialize classification per process for bounded idempotent replay;
+    # Backend persists completed runs. Use provider idempotency for multi-replica scale.
+    with lock:
+        if key in cache:
+            previous_hash, output = cache[key]
+            if previous_hash != fingerprint:
+                raise AgentError(409, "IDEMPOTENCY_CONFLICT", "Key was used with a different request")
+            event("analysis_reused", run_id=str(body.run_id), purpose="CLASSIFY")
+            return output
+        if settings.classification_provider == "MOCK" and settings.environment == "production":
+            raise AgentError(503, "MOCK_NOT_ALLOWED", "Simulated classification is disabled in production")
+        event("analysis_started", run_id=str(body.run_id), purpose="CLASSIFY",
+              provider=settings.classification_provider, document_count=len(body.documents),
+              requirement_count=len(body.requirements))
+        files, total = [], 0
+        for index, document in enumerate(body.documents):
+            started = perf_counter()
+            try:
+                content = supplied_files[index] if supplied_files is not None else read_document(document, settings)
+            except AgentError as exc:
+                event("document_read", run_id=str(body.run_id), document_id=str(document.document_id),
+                      status="failed", error_code=exc.code, duration_ms=elapsed_ms(started))
+                raise
+            event("document_read", run_id=str(body.run_id), document_id=str(document.document_id),
+                  status="ok", size_bytes=len(content), duration_ms=elapsed_ms(started))
+            total += len(content)
+            if total > 100 * 1024 * 1024:
+                raise AgentError(413, "BATCH_TOO_LARGE", "Select a smaller batch of documents")
+            files.append(content)
+        if settings.classification_provider == "MOCK":
+            items = []
+            for doc, content in zip(body.documents, files, strict=True):
+                text = (doc.original_name + " " + content.decode("utf-8", errors="ignore")).casefold().replace("_", " ")
+                invalid = any(word in text for word in ("invalid", "unrelated", "无效"))
+                scores = [(max((len(word) for word in KEYWORDS.get(req.document_type, ()) if word in text), default=0), req) for req in body.requirements]
+                score, candidate = max(scores, key=lambda item: item[0], default=(0, None))
+                match = candidate if score and not invalid else None
+                items.append({"document_id": str(doc.document_id), "category": "INVALID" if invalid else "REQUIREMENT" if match else "OTHER", "document_type": match.document_type if match else None, "requirement_id": str(match.id) if match else None, "confidence": 0.90 if match else 0.50})
+            result = {"schema_version": "1", "run_id": str(body.run_id), "model_version": "mock-classifier-v1", "classifications": items}
+        elif settings.classification_provider == "DEEPSEEK":
+            result = classify_with_deepseek(body, files, settings)
+        else:
+            require_model_config(settings)
+            if settings.classification_provider != "REMOTE":
+                raise AgentError(503, "MODEL_NOT_CONFIGURED", "Classification is not enabled")
+            payload = body.model_dump(mode="json")
+            for document, content in zip(payload["documents"], files, strict=True):
+                document.pop("storage_key")
+                document["content_base64"] = base64.b64encode(content).decode()
+            try:
+                with httpx.Client(timeout=httpx.Timeout(settings.model_request_timeout_seconds, connect=settings.model_connect_timeout_seconds), follow_redirects=False, trust_env=False) as client:
+                    with client.stream("POST", settings.model_api_url, json=payload, headers={"Authorization": f"Bearer {settings.model_api_key.get_secret_value()}", "Idempotency-Key": key}) as response:
+                        if response.status_code != 200:
+                            raise AgentError(503, "MODEL_UNAVAILABLE", "Remote model is unavailable")
+                        raw = bytearray()
+                        for chunk in response.iter_bytes():
+                            raw.extend(chunk)
+                            if len(raw) > 1024 * 1024:
+                                raise AgentError(502, "MODEL_INVALID_RESPONSE", "Model response is too large")
+                        result = httpx.Response(200, content=bytes(raw)).json()
+            except httpx.TimeoutException:
+                raise AgentError(504, "MODEL_TIMEOUT", "Remote model timed out") from None
+            except httpx.HTTPError:
+                raise AgentError(503, "MODEL_UNAVAILABLE", "Remote model is unavailable") from None
+            except ValueError:
+                raise AgentError(502, "MODEL_INVALID_RESPONSE", "Model response is not JSON") from None
+        try:
+            output = ClassificationResponse.model_validate(result)
+            ids = [doc.document_id for doc in body.documents]
+            requirements = {req.id for req in body.requirements}
+            if output.run_id != body.run_id or [item.document_id for item in output.classifications] != ids:
+                raise ValueError("Mismatched document IDs")
+            if any(item.requirement_id and item.requirement_id not in requirements for item in output.classifications):
+                raise ValueError("Unknown requirement")
+        except (ValueError, ValidationError):
+            event("classification_validation", run_id=str(body.run_id), status="failed")
+            raise AgentError(502, "MODEL_INVALID_RESPONSE", "Invalid classification response") from None
+        event("classification_validation", run_id=str(body.run_id), status="ok", result_count=len(output.classifications))
+        for item in output.classifications:
+            event("classification_result", run_id=str(body.run_id), document_id=str(item.document_id),
+                  category=item.category, requirement_id=str(item.requirement_id) if item.requirement_id else None,
+                  document_type=item.document_type)
+        cache[key] = (fingerprint, output)
+        if len(cache) > 128:
+            cache.popitem(last=False)
+        event("analysis_completed", run_id=str(body.run_id), purpose="CLASSIFY", status="ok")
+        return output

@@ -1,0 +1,6 @@
+[advanced]
+
+# Revalidate cached files on navigation, including HTML served for SPA routes.
+[[advanced.headers]]
+source = "**"
+headers = { Cache-Control = "no-cache" }

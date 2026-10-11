@@ -1,0 +1,197 @@
+name: acc-system
+
+x-backend-environment: &backend-environment
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+  DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+  REDIS_URL: ${REDIS_URL:?REDIS_URL is required}
+  WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-10}
+  AGENT_URL: ${AGENT_URL:-http://agent:8000}
+  AGENT_CLASSIFICATION_PROVIDER: ${AGENT_CLASSIFICATION_PROVIDER:-DISABLED}
+  MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-26214400}
+  CLAMAV_HOST: ${CLAMAV_HOST:-}
+  CLAMAV_PORT: ${CLAMAV_PORT:-3310}
+  JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+  JWT_ISSUER: ${JWT_ISSUER:-acc-system}
+  JWT_AUDIENCE: ${JWT_AUDIENCE:-acc-system-web}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost}
+
+services:
+  agent:
+    image: ${AGENT_IMAGE:-acc-system-agent:local}
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      CLASSIFICATION_PROVIDER: ${AGENT_CLASSIFICATION_PROVIDER:-DISABLED}
+      REVIEW_PROVIDER: ${AGENT_REVIEW_PROVIDER:-DISABLED}
+      DOCUMENT_PATH: /data/documents
+      MAX_DOCUMENT_BYTES: ${MAX_UPLOAD_BYTES:-26214400}
+      MODEL_API_URL: ${MODEL_API_URL:-}
+      MODEL_HEALTH_URL: ${MODEL_HEALTH_URL:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MODEL_NAME: ${MODEL_NAME:-deepseek/deepseek-v4.1-flash}
+      NOVITA_API_KEY: ${NOVITA_API_KEY:-}
+      OCR_API_URL: ${OCR_API_URL:-}
+      OCR_HEALTH_URL: ${OCR_HEALTH_URL:-}
+      OCR_API_KEY: ${OCR_API_KEY:-}
+      OCR_MODEL: ${OCR_MODEL:-deepseek/deepseek-ocr-2}
+      AGENT_API_KEY: ${AGENT_API_KEY:-}
+      MODEL_CONNECT_TIMEOUT_SECONDS: ${MODEL_CONNECT_TIMEOUT_SECONDS:-10}
+      MODEL_REQUEST_TIMEOUT_SECONDS: ${MODEL_REQUEST_TIMEOUT_SECONDS:-300}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    volumes:
+      - documents:/data/documents:ro
+    networks:
+      - internal
+
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17.6-alpine}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:8.2.1-alpine}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
+
+  clamav:
+    image: ${CLAMAV_IMAGE:-clamav/clamav:1.4}
+    profiles: ["malware-scan"]
+    restart: unless-stopped
+    volumes:
+      - clamav_data:/var/lib/clamav
+    networks:
+      - internal
+
+  migrate:
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+
+  backend:
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
+    environment:
+      <<: *backend-environment
+      # Backend has no public port; Nginx overwrites incoming forwarding headers.
+      FORWARDED_ALLOW_IPS: "*"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/ready', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 6
+    restart: unless-stopped
+    volumes:
+      - documents:/data/documents
+      - quarantine:/data/quarantine
+    networks:
+      - internal
+
+  bootstrap:
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
+    profiles: ["tools"]
+    command: ["python", "-m", "app.cli", "bootstrap-admin"]
+    environment:
+      <<: *backend-environment
+      BOOTSTRAP_FIRM_NAME: ${BOOTSTRAP_FIRM_NAME:-Local Accounting}
+      BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-Local Admin}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@local.test}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - internal
+
+  worker:
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
+    command: ["python", "-m", "app.worker"]
+    environment: *backend-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+    stop_grace_period: 15s
+    volumes:
+      - documents:/data/documents
+      - quarantine:/data/quarantine
+    networks:
+      - internal
+
+  frontend:
+    image: ${FRONTEND_IMAGE:?FRONTEND_IMAGE is required}
+    restart: unless-stopped
+    networks:
+      - internal
+
+  nginx:
+    image: ${NGINX_IMAGE:?NGINX_IMAGE is required}
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    ports:
+      - "80:80"
+    restart: unless-stopped
+    volumes:
+      - documents:/data/documents:ro
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  clamav_data:
+  documents:
+  postgres_data:
+  quarantine:
+  redis_data:
